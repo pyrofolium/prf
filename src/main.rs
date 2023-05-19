@@ -6,10 +6,6 @@ pub mod task {
     use reqwest;
     use std::time::Duration;
     use async_std;
-    use fred::error::RedisError;
-    use fred::prelude::FromRedis;
-    use fred::types::{RedisKey, RedisValue};
-    use fred::types::RedisValueKind::String;
     use rand::{Rng};
     use crate::task::TaskType::{Bar, Baz, Foo};
 
@@ -79,55 +75,6 @@ pub mod task {
         }
     }
 
-    impl From<&RedisValue> for TaskState {
-        fn from(value: &RedisValue) -> Self {
-            match value {
-                RedisValue::String(s) => {
-                    match s.to_string().as_str() {
-                        TaskState::STARTED => TaskState::Started,
-                        TaskState::NOTSTARTED => TaskState::NotStarted,
-                        TaskState::COMPLETE => TaskState::Complete,
-                        _ => {
-                            panic!("invalid string used to represent task state in redis")
-                        }
-                    }
-                }
-                _ => {
-                    panic!("invalid RedisValue, cannot convert to TaskState");
-                }
-            }
-        }
-    }
-    impl FromRedis for TaskType {
-        fn from_value(value: RedisValue) -> Result<Self, RedisError> {
-            value.convert()
-        }
-    }
-
-    impl From<RedisValue> for TaskType {
-        fn from(value: RedisValue) -> Self {
-            match value {
-                RedisValue::Map(map) => {
-                    let task_id = map.get(&RedisKey::from("task_id")).unwrap().as_u64().unwrap();
-                    let task_type = map.get(&RedisKey::from("task_type")).unwrap().as_str().unwrap().into_owned();
-                    let task_time = map.get(&RedisKey::from("task_time")).unwrap().as_u64().unwrap();
-                    let task_state = TaskState::from(map.get(&RedisKey::from("task_state")).unwrap());
-                    match task_type.as_str() {
-                        TaskType::FOO => Foo(task_id, task_time, task_state),
-                        TaskType::BAR => Bar(task_id, task_time, task_state),
-                        TaskType::BAZ => Baz(task_id, task_time, task_state),
-                        _ => {
-                            panic!("invalid task type used to represent Task type in redis")
-                        }
-                    }
-                },
-                _ => {
-                    panic!("Error only redis map values can be converted to Tasks")
-                }
-            }
-        }
-    }
-
     #[derive(Debug)]
     pub enum TaskType {
         Foo(TaskId, TaskTimeStamp, TaskState),
@@ -179,12 +126,9 @@ mod state {
     use std::collections::HashMap;
     use crate::task::{TaskConstants, TaskState, TaskStateConstants, TaskType};
     use async_trait::async_trait;
-    use fred::error::RedisError;
-    // use rusqlite::{Connection, Error, OptionalExtension, Result, Row};
     use crate::task::TaskState::{Complete, NotStarted, Started};
     use crate::task::TaskType::{Bar, Baz, Foo};
-    use fred::prelude::{ClientLike, ListInterface, RedisClient, TransactionInterface, RedisValue, HashesInterface, SetsInterface};
-    use fred::types::{RedisKey, RedisMap};
+    use deadpool_sqlite::{Config, InteractError, Pool, Runtime};
 
     #[async_trait]
     pub trait State: Sized {
@@ -195,39 +139,37 @@ mod state {
         async fn transition_task(&self, id: &u64);
     }
 
-    pub struct RedisState {
-        pub client: RedisClient,
-    }
 
-    pub trait RedisConstants {
-        const TASK_ID_LIST_KEY_PREFIX: &'static str;
-        const TASK_INFO_HASHSET_KEY_PREFIX: &'static str;
-        fn create_hash_set_key(id: u64, state: &TaskState) -> String {
-            Self::TASK_INFO_HASHSET_KEY_PREFIX.to_owned() + "_" + &id.to_string() + "_" + state.into()
-        }
-
-        fn create_task_id_list_key(state: &TaskState) -> &'static str {
-            match state {
-                Complete => "task_ids_COMPLETE",
-                Started => "task_ids_STARTED",
-                NotStarted => "task_ids_NOTSTARTED"
-            }
-        }
-    }
-
-    impl RedisConstants for RedisState {
-        const TASK_ID_LIST_KEY_PREFIX: &'static str = "task_ids";
-        const TASK_INFO_HASHSET_KEY_PREFIX: &'static str = "task_info";
+    pub struct SqliteState {
+        pool: Pool,
     }
 
     #[async_trait]
-    impl State for RedisState {
+    impl State for SqliteState {
         async fn initialize_state() -> Self {
-            let client = RedisClient::default();
-            client.connect();
-            client.wait_for_connect().await.unwrap();
-            RedisState {
-                client
+            let cfg = Config {
+                path: "db.sqlite3".into(),
+                pool: None,
+            };
+            let pool = cfg.create_pool(Runtime::Tokio1).unwrap();
+            let connection = pool.get().await.unwrap();
+            let result = connection.interact(|connection| {
+                let result = connection.execute("
+                    BEGIN;
+                    CREATE TABLE IF NOT EXISTS tasks (
+                        id INT,
+                        task_time INT NOT NULL,
+                        task_type CHAR NOT NULL,
+                        task_state CHAR NOT NULL,
+                        PRIMARY KEY (id),
+                    );
+                    CREATE INDEX IF NOT EXISTS timestamp_sort ON tasks.task_time;
+                COMMIT;
+                ", ());
+                result
+            }).await.unwrap().unwrap();
+            SqliteState {
+                pool
             }
         }
 
@@ -236,45 +178,17 @@ mod state {
         }
 
         async fn add_task(&self, task: TaskType) {
-            let (task_type, id, time, state): (&str, u64, u64, TaskState) = match task {
-                Foo(id, time, state) => ((&task).into(), id, time, state),
-                Bar(id, time, state) => ((&task).into(), id, time, state),
-                Baz(id, time, state) => ((&task).into(), id, time, state)
-            };
-            let mut redis_map = RedisMap::new();
-            redis_map.insert(RedisKey::from("task_id"), RedisValue::from(id as i64));
-            redis_map.insert(RedisKey::from("task_type"), RedisValue::from(task_type));
-            redis_map.insert(RedisKey::from("task_time"), RedisValue::from(time as i64));
-            redis_map.insert(RedisKey::from("task_state"), RedisValue::from(<&TaskState as Into<&str>>::into(&state)));
-            let transaction = self.client.multi();
-            let _: u64 = transaction.sadd(RedisState::create_task_id_list_key(&state), id as i64).await.unwrap();
-            let elements_added: u64 = transaction.hset(Self::create_hash_set_key(id, &state), redis_map).await.unwrap();
-            if elements_added != 3 {
-                panic!("only 3 properties are allowed per task.")
-            }
-            transaction.exec::<(u64, )>(true).await.unwrap();
+            todo!()
         }
 
         async fn get_all_tasks(&self, task_state: &TaskState) -> Vec<TaskType> {
-            let transaction = self.client.multi();
-            let ids: RedisValue = transaction.lrange(RedisState::create_task_id_list_key(task_state), 0, -1).await.unwrap();
-            let mut tasks: Vec<TaskType> = vec![];
-            // for id in ids.iter() {
-            //     tasks.push(transaction.hgetall(RedisState::create_hash_set_key(*id, task_state)).await.unwrap());
-            // }
-            tasks
+            todo!()
         }
 
         async fn transition_task(&self, id: &u64) {
             todo!()
         }
     }
-
-
-    // struct SqliteState {
-    //     connection: Connection,
-    //     next_state: Option<TaskState>,
-    // }
     //
     // impl SqliteState {
     //     pub fn new(path_str: &str) -> Self {
@@ -378,7 +292,6 @@ mod app {
 
 #[cfg(test)]
 mod tests {
-    use fred::prelude::ServerInterface;
     use crate::state;
     use crate::state::State;
     use crate::task::TaskState;
@@ -386,12 +299,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_state() {
-        let state = state::RedisState::initialize_state().await;
-        let _: String = state.client.flushall(true).await.unwrap();
-        let task = Foo(1, 0, TaskState::NotStarted);
-        state.add_task(task);
-        let tasks = state.get_all_tasks(&TaskState::NotStarted).await;
-        println!("tasks: {tasks:?}");
-
+        let state = state::SqliteState::initialize_state().await;
     }
 }
