@@ -6,7 +6,6 @@ pub mod task {
     use reqwest;
     use std::time::Duration;
     use async_std;
-    use rand::{Rng};
     use crate::task::TaskType::{Bar, Baz, Foo};
 
 
@@ -63,8 +62,8 @@ pub mod task {
         }
     }
 
-    type TaskId = u64;
-    type TaskTimeStamp = u64;
+    pub type TaskId = u64;
+    pub type TaskTimeStamp = u64;
 
     pub trait TaskConstants {
         const FOO: &'static str;
@@ -89,7 +88,7 @@ pub mod task {
         }
     }
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug, Clone, Copy)]
     pub enum TaskType {
         Foo(Option<TaskId>, TaskTimeStamp, TaskState),
         Bar(Option<TaskId>, TaskTimeStamp, TaskState),
@@ -97,7 +96,7 @@ pub mod task {
     }
 
     impl TaskType {
-        fn transition_task(&self) -> TaskType {
+        pub fn transition_task(&self) -> TaskType {
             match self {
                 Self::Foo(id, time, state) =>
                     Self::Foo(*id, *time, state.transition_state()),
@@ -108,31 +107,34 @@ pub mod task {
             }
         }
 
-        async fn handle_task(&self, rando: &mut rand::rngs::ThreadRng) -> TaskType {
+        pub async fn handle_task(&self) -> TaskType {
             match self {
-                Self::Foo(Some(id), _, _) => {
+                Self::Foo(Some(id), _, TaskState::Started) => {
                     async_std::task::sleep(Duration::from_secs(3)).await;
-                    async_std::println!("Foo {id}").await;
+                    std::println!("Foo {id}");
                     self.transition_task()
                 }
                 Self::Foo(None, _, _) => {
                     panic!("Cannot execute handler on Foo task with no id.")
                 }
-                Self::Baz(_, _, _) => {
-                    let number = rando.gen_range(0..344);
-                    async_std::println!("Baz {number}").await;
+                Self::Baz(_, _, TaskState::Started) => {
+                    let number = rand::random::<u64>() % 344;
+                    std::println!("Baz {number}");
                     self.transition_task()
                 }
-                Self::Bar(_, _, _) => {
+                Self::Bar(_, _, TaskState::Started) => {
                     let url = "https://www.whattimeisitrightnow.com/";
                     if let Ok(response) = reqwest::get(url).await {
                         let status_code = response.status();
                         let status_code_str = status_code.as_str();
-                        async_std::println!("{status_code_str}").await;
+                        std::println!("{status_code_str}");
                         self.transition_task()
                     } else {
                         panic!("Undefined behavior: {url} not found")
                     }
+                }
+                _ => {
+                    panic!("handle tasks only works on tasks that have been transitioned to <Started>")
                 }
             }
         }
@@ -145,6 +147,8 @@ mod state {
     use crate::task::TaskType::{Bar, Baz, Foo};
     use deadpool_sqlite::{Config, Pool, Runtime};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use tokio::task::JoinHandle;
+    use crate::task;
 
     #[async_trait]
     pub trait State: Sized {
@@ -152,7 +156,9 @@ mod state {
         async fn get_tasks_that_need_to_be_executed(&self) -> Vec<TaskType>;
         async fn add_task(&self, task: TaskType);
         async fn get_all_tasks(&self, task_state: &TaskState) -> Vec<TaskType>;
-        async fn transition_task(&self, id: &u64);
+
+        async fn consume_tasks(&self, tasks_not_started: Vec<TaskType>) -> Vec<JoinHandle<TaskType>>;
+
         async fn clear_all(&self);
     }
 
@@ -187,15 +193,55 @@ mod state {
             }
         }
 
+        async fn consume_tasks(&self, tasks_not_started: Vec<TaskType>) -> Vec<JoinHandle<TaskType>>{
+
+
+            let mut join_handles = Vec::with_capacity(tasks_not_started.len());
+            let mut_ref_join_handler = &mut join_handles;
+            for task in tasks_not_started.into_iter() {
+                let pool = self.pool.clone();
+                let handle = tokio::spawn(async move {
+                    fn get_parameters_from_task(task: TaskType) -> (task::TaskId, &'static str) {
+                        match task {
+                            Foo(Some(id), _, state) => (id, (&state).into()),
+                            Bar(Some(id), _, state) => (id, (&state).into()),
+                            Baz(Some(id), _, state) => (id, (&state).into()),
+                            _ => {
+                                panic!("Cannot update tasks with no id.")
+                            }
+                        }
+                    }
+                    let connection = pool.get().await.unwrap();
+                    connection.interact(move |connection| {
+                        let parameters_not_started: (u64, &str) = get_parameters_from_task(task);
+                        connection.execute(
+                            "UPDATE tasks SET task_state = ?2 WHERE id = ?1",
+                            parameters_not_started).unwrap();
+                    }).await.unwrap();
+                    let pending_task = task.transition_task();
+                    let finished_task = pending_task.handle_task().await;
+                    connection.interact(move |connection| {
+                        let parameters_finished: (u64, &str) = get_parameters_from_task(finished_task);
+                        connection.execute(
+                            "UPDATE tasks SET task_state = ?2 WHERE id = ?1",
+                            parameters_finished).unwrap();
+                    }).await.unwrap();
+                    finished_task
+                });
+                mut_ref_join_handler.push(handle);
+            }
+            join_handles
+        }
+
         async fn get_tasks_that_need_to_be_executed(&self) -> Vec<TaskType> {
             let connection = self.pool.get().await.unwrap();
             connection.interact(move |connection| {
                 let mut statement = connection.prepare("SELECT id, task_time, task_type, task_state FROM tasks WHERE tasks.task_state = 'NOTSTARTED' AND task_time <= ?1;").unwrap();
-                let mut result = vec![];
+                let mut result = vec![]; //allocation here but easier to debug. It's more efficient to return an iterator
 
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
 
-                statement.query_map((now,), |row|{
+                statement.query_map((now, ), |row| {
                     let (id, time, task_type, state): (i64, i64, String, String) =
                         (row.get(0).unwrap(), row.get(1).unwrap(), row.get(2).unwrap(), row.get(3).unwrap());
                     match task_type.as_str() {
@@ -206,7 +252,7 @@ mod state {
                             panic!("invalid string, cannot convert to task.")
                         }
                     }
-                }).unwrap().for_each(|task|{
+                }).unwrap().for_each(|task| {
                     result.push(task.unwrap());
                 });
                 result
@@ -256,10 +302,6 @@ mod state {
             }).await.unwrap()
         }
 
-        async fn transition_task(&self, id: &u64) {
-            todo!()
-        }
-
         async fn clear_all(&self) {
             let connection = self.pool.get().await.unwrap();
             connection.interact(|connection| {
@@ -301,6 +343,7 @@ mod tests {
     use crate::task::TaskState::{Complete, NotStarted, Started};
     use crate::task::TaskType::{Baz, Foo};
     use std::time::{SystemTime, UNIX_EPOCH};
+    use async_std::prelude::FutureExt;
 
     #[tokio::test]
     async fn test_state() {
@@ -320,11 +363,15 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
         let v4 = state.get_tasks_that_need_to_be_executed().await;
         assert_eq!(v4.len(), 1);
+        let handles = state.consume_tasks(v4).await;
+        for handle in handles {
+            handle.await.unwrap();
+        }
         let v5 = state.get_all_tasks(&Complete).await;
-        assert_eq!(v5.len(), 0);
+        assert_eq!(v5.len(), 1);
         let v6 = state.get_all_tasks(&Started).await;
         assert_eq!(v6.len(), 0);
         let v7 = state.get_all_tasks(&NotStarted).await;
-        assert_eq!(v7.len(), 3);
+        assert_eq!(v7.len(), 2);
     }
 }
