@@ -25,9 +25,22 @@ pub mod task {
     impl From<&TaskState> for &str {
         fn from(task_state: &TaskState) -> &'static str {
             match task_state {
-                TaskState::Started => TaskState::NOTSTARTED,
+                TaskState::Started => TaskState::STARTED,
                 TaskState::NotStarted => TaskState::NOTSTARTED,
                 TaskState::Complete => TaskState::COMPLETE
+            }
+        }
+    }
+
+    impl From<&str> for TaskState {
+        fn from(value: &str) -> Self {
+            match value {
+                TaskState::NOTSTARTED => Self::NotStarted,
+                TaskState::STARTED => Self::Started,
+                TaskState::COMPLETE => Self::Complete,
+                _ => {
+                    panic!("invalid string, cannot convert to TaskState")
+                }
             }
         }
     }
@@ -65,21 +78,22 @@ pub mod task {
         const BAZ: &'static str = "BAZ";
     }
 
+
     impl From<&TaskType> for &'static str {
         fn from(task_type: &TaskType) -> &'static str {
             match task_type {
-                TaskType::Foo(_, _, _) => TaskType::FOO,
-                TaskType::Bar(_, _, _) => TaskType::BAR,
-                TaskType::Baz(_, _, _) => TaskType::BAZ
+                Foo(_, _, _) => TaskType::FOO,
+                Bar(_, _, _) => TaskType::BAR,
+                Baz(_, _, _) => TaskType::BAZ
             }
         }
     }
 
-    #[derive(Debug)]
+    #[derive(Debug, Clone)]
     pub enum TaskType {
-        Foo(TaskId, TaskTimeStamp, TaskState),
-        Bar(TaskId, TaskTimeStamp, TaskState),
-        Baz(TaskId, TaskTimeStamp, TaskState),
+        Foo(Option<TaskId>, TaskTimeStamp, TaskState),
+        Bar(Option<TaskId>, TaskTimeStamp, TaskState),
+        Baz(Option<TaskId>, TaskTimeStamp, TaskState),
     }
 
     impl TaskType {
@@ -96,10 +110,13 @@ pub mod task {
 
         async fn handle_task(&self, rando: &mut rand::rngs::ThreadRng) -> TaskType {
             match self {
-                Self::Foo(id, _, _) => {
+                Self::Foo(Some(id), _, _) => {
                     async_std::task::sleep(Duration::from_secs(3)).await;
                     async_std::println!("Foo {id}").await;
                     self.transition_task()
+                }
+                Self::Foo(None, _, _) => {
+                    panic!("Cannot execute handler on Foo task with no id.")
                 }
                 Self::Baz(_, _, _) => {
                     let number = rando.gen_range(0..344);
@@ -123,20 +140,20 @@ pub mod task {
 }
 
 mod state {
-    use std::collections::HashMap;
-    use crate::task::{TaskConstants, TaskState, TaskStateConstants, TaskType};
+    use crate::task::{TaskConstants, TaskState, TaskType};
     use async_trait::async_trait;
-    use crate::task::TaskState::{Complete, NotStarted, Started};
     use crate::task::TaskType::{Bar, Baz, Foo};
-    use deadpool_sqlite::{Config, InteractError, Pool, Runtime};
+    use deadpool_sqlite::{Config, Pool, Runtime};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[async_trait]
     pub trait State: Sized {
         async fn initialize_state() -> Self;
-        async fn get_next_task(&self) -> Option<TaskType>;
+        async fn get_tasks_that_need_to_be_executed(&self) -> Vec<TaskType>;
         async fn add_task(&self, task: TaskType);
         async fn get_all_tasks(&self, task_state: &TaskState) -> Vec<TaskType>;
         async fn transition_task(&self, id: &u64);
+        async fn clear_all(&self);
     }
 
 
@@ -153,126 +170,115 @@ mod state {
             };
             let pool = cfg.create_pool(Runtime::Tokio1).unwrap();
             let connection = pool.get().await.unwrap();
-            let result = connection.interact(|connection| {
+            connection.interact(|connection| {
                 let transaction = connection.transaction().unwrap();
                 transaction.execute("CREATE TABLE IF NOT EXISTS tasks (
-                        id INT,
-                        task_time INT NOT NULL,
-                        task_type CHAR NOT NULL,
+                        id INTEGER PRIMARY KEY,
                         task_state CHAR NOT NULL,
-                        PRIMARY KEY (id)
+                        task_time INT NOT NULL,
+                        task_type CHAR NOT NULL
                     );", ()).unwrap();
+                transaction.execute("CREATE INDEX IF NOT EXISTS taskstatesort ON tasks (task_state);", ()).unwrap();
                 transaction.execute("CREATE INDEX IF NOT EXISTS timesort ON tasks (task_time);", ()).unwrap();
                 transaction.commit()
-
             }).await.unwrap().unwrap();
             SqliteState {
                 pool
             }
         }
 
-        async fn get_next_task(&self) -> Option<TaskType> {
-            todo!()
+        async fn get_tasks_that_need_to_be_executed(&self) -> Vec<TaskType> {
+            let connection = self.pool.get().await.unwrap();
+            connection.interact(move |connection| {
+                let mut statement = connection.prepare("SELECT id, task_time, task_type, task_state FROM tasks WHERE tasks.task_state = 'NOTSTARTED' AND task_time <= ?1;").unwrap();
+                let mut result = vec![];
+
+                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+
+                statement.query_map((now,), |row|{
+                    let (id, time, task_type, state): (i64, i64, String, String) =
+                        (row.get(0).unwrap(), row.get(1).unwrap(), row.get(2).unwrap(), row.get(3).unwrap());
+                    match task_type.as_str() {
+                        TaskType::FOO => Ok(Foo(Some(id as u64), time as u64, state.as_str().into())),
+                        TaskType::BAR => Ok(Bar(Some(id as u64), time as u64, state.as_str().into())),
+                        TaskType::BAZ => Ok(Baz(Some(id as u64), time as u64, state.as_str().into())),
+                        _ => {
+                            panic!("invalid string, cannot convert to task.")
+                        }
+                    }
+                }).unwrap().for_each(|task|{
+                    result.push(task.unwrap());
+                });
+                result
+            }).await.unwrap()
         }
 
         async fn add_task(&self, task: TaskType) {
-            todo!()
+            let (task_type, optional_id, time, state): (&str, Option<u64>, u64, &str) = match task {
+                TaskType::Foo(id, time, state) => (TaskType::FOO, id, time, (&state).into()),
+                TaskType::Bar(id, time, state) => (TaskType::BAR, id, time, (&state).into()),
+                TaskType::Baz(id, time, state) => (TaskType::BAZ, id, time, (&state).into())
+            };
+            let connection = self.pool.get().await.unwrap();
+            let rows_updated = connection.interact(move |connection| {
+                if let Some(id) = optional_id {
+                    connection.execute("INSERT INTO tasks (id, task_time, task_type, task_state) VALUES (?1, ?2, ?3, ?4)", (id, time, task_type, state)).unwrap()
+                } else {
+                    connection.execute("INSERT INTO tasks (task_time, task_type, task_state) VALUES (?1, ?2, ?3)", (time, task_type, state)).unwrap()
+                }
+            }).await.unwrap();
+            if rows_updated != 1 {
+                panic!("insert says less or more than 1 row was updated.")
+            }
         }
 
         async fn get_all_tasks(&self, task_state: &TaskState) -> Vec<TaskType> {
-            todo!()
+            let task_state_string: &str = task_state.into();
+            let connection = self.pool.get().await.unwrap();
+            connection.interact(move |connection| {
+                let mut statement = connection.prepare("SELECT id, task_time, task_type, task_state FROM tasks WHERE tasks.task_state = ?1;").unwrap();
+                let mut result = vec![];
+                statement.query_map((task_state_string, ), |row| {
+                    let (id, time, task_type, state): (i64, i64, String, String) =
+                        (row.get(0).unwrap(), row.get(1).unwrap(), row.get(2).unwrap(), row.get(3).unwrap());
+                    match task_type.as_str() {
+                        TaskType::FOO => Ok(Foo(Some(id as u64), time as u64, state.as_str().into())),
+                        TaskType::BAR => Ok(Bar(Some(id as u64), time as u64, state.as_str().into())),
+                        TaskType::BAZ => Ok(Baz(Some(id as u64), time as u64, state.as_str().into())),
+                        _ => {
+                            panic!("invalid string, cannot convert to task.")
+                        }
+                    }
+                }).unwrap().for_each(|task| {
+                    result.push(task.unwrap());
+                });
+                result
+            }).await.unwrap()
         }
 
         async fn transition_task(&self, id: &u64) {
             todo!()
         }
+
+        async fn clear_all(&self) {
+            let connection = self.pool.get().await.unwrap();
+            connection.interact(|connection| {
+                connection.execute("DELETE FROM tasks;", ()).unwrap()
+            }).await.unwrap();
+        }
     }
-    //
-    // impl SqliteState {
-    //     pub fn new(path_str: &str) -> Self {
-    //         SqliteState {
-    //             connection: Connection::open(Path::new(path_str)).unwrap(),
-    //             next_state: None,
-    //         }
-    //     }
-    //
-    //     pub fn row_to_task(row: &Row) -> Result<TaskType, &'static str> {
-    //         fn string_to_task_state(s: &str) -> TaskState {
-    //             match s {
-    //                 "NOTSTARTED" => NotStarted,
-    //                 "STARTED" => Started,
-    //                 "COMPLETE" => Complete,
-    //                 _ => Err("Invalid Task state string in tasks table")
-    //             }
-    //         }
-    //
-    //         match row.get(2) {
-    //             Ok("FOO") => Ok(Foo(row.get(0)?, row.get(1)?, string_to_task_state(row.get(3)?)?)),
-    //             Ok("BAR") => Ok(Bar(row.get(0)?, row.get(1)?, string_to_task_state(row.get(3)?)?)),
-    //             Ok("BAZ") => Ok(Baz(row.get(0)?, row.get(1)?, string_to_task_state(row.get(3)?)?)),
-    //             Ok(_) => Err("Invalid string for task type in table"),
-    //             Err(e) => Err("Getting column for table had an error")
-    //         }
-    //     }
-    // }
-    //
-    //
-    // impl State for SqliteState {
-    //     fn initialize_state(&self) -> Result<(), &'static str> {
-    //         let connection = &self.connection;
-    //         if let Ok(()) = connection.execute_batch("
-    //             BEGIN;
-    //                 CREATE TABLE IF NOT EXISTS tasks (
-    //                     id INT,
-    //                     task_time INT NOT NULL,
-    //                     task_type CHAR NOT NULL,
-    //                     task_state CHAR NOT NULL,
-    //                     PRIMARY KEY (id),
-    //                 );
-    //                 CREATE INDEX IF NOT EXISTS timestamp_sort ON tasks.task_time;
-    //             COMMIT;
-    //         ") {
-    //             Ok(())
-    //         } else {
-    //             Err("Problem initializing state")
-    //         }
-    //     }
-    //
-    //
-    //     fn get_next_task(&self) -> Result<Option<TaskType>, &'static str> {
-    //         let mut statement = self.connection.prepare("SELECT id, task_time, task_type, task_state FROM tasks ORDER BY task_time ASC LIMIT 1;")?;
-    //         match statement.query_row([], row_to_task).optional() {
-    //             Ok(optional_task) => Ok(optional_task),
-    //             Err(e) => Err("Problem querying table")
-    //         }
-    //     }
-    //
-    //     fn add_task(&self, task: TaskType) -> Result<(), &'static str> {
-    //
-    //     }
-    //
-    //     fn get_all_tasks(&self) -> Result<Vec<TaskType>, &'static str> {
-    //         let mut statement = self.connection.prepare("SELECT id, task_time, task_type, task_state FROM tasks;")?;
-    //         if let Ok(iterator) = statement.query_map([], |row| {
-    //             match SqliteState::row_to_task(row) {
-    //                 Ok(v) => Ok(v),
-    //                 Err(_) => Err(rusqlite::Error::ExecuteReturnedResults)
-    //             }
-    //         }) {
-    //             Ok(iterator.collect::<Vec<TaskType>>())
-    //         } else {
-    //             Err("Failed to convert query results to a vector")
-    //         }
-    //     }
 }
 
 mod executor {
     use crate::state::State;
     use async_trait::async_trait;
+    use crate::task::TaskType;
 
     #[async_trait]
     pub trait TaskRunner<T: State>: Sized {
-        fn initialize_runner(state: T) -> Result<Self, &'static str>;
+        fn initialize_runner(state: &T) -> Self;
+        async fn execute_tasks();
+        async fn add_task(task: TaskType);
         async fn run(&self) -> Result<(), &'static str>;
     }
 }
@@ -292,11 +298,33 @@ mod app {
 mod tests {
     use crate::state;
     use crate::state::State;
-    use crate::task::TaskState;
-    use crate::task::TaskType::Foo;
+    use crate::task::TaskState::{Complete, NotStarted, Started};
+    use crate::task::TaskType::{Baz, Foo};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
     #[tokio::test]
     async fn test_state() {
         let state = state::SqliteState::initialize_state().await;
+        state.clear_all().await;
+        let task = Foo(None, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 1000000, NotStarted);
+        state.add_task(task.clone()).await;
+        state.add_task(task.clone()).await;
+        let v = state.get_all_tasks(&NotStarted).await;
+        assert_eq!(v.len(), 2);
+        let v2 = state.get_tasks_that_need_to_be_executed().await;
+        assert_eq!(v2.len(), 0);
+        let future_task = Baz(None, SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 2, NotStarted);
+        state.add_task(future_task).await;
+        let v3 = state.get_tasks_that_need_to_be_executed().await;
+        assert_eq!(v3.len(), 0);
+        tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
+        let v4 = state.get_tasks_that_need_to_be_executed().await;
+        assert_eq!(v4.len(), 1);
+        let v5 = state.get_all_tasks(&Complete).await;
+        assert_eq!(v5.len(), 0);
+        let v6 = state.get_all_tasks(&Started).await;
+        assert_eq!(v6.len(), 0);
+        let v7 = state.get_all_tasks(&NotStarted).await;
+        assert_eq!(v7.len(), 3);
     }
 }
