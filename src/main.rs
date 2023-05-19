@@ -154,19 +154,17 @@ mod state {
             let pool = cfg.create_pool(Runtime::Tokio1).unwrap();
             let connection = pool.get().await.unwrap();
             let result = connection.interact(|connection| {
-                let result = connection.execute("
-                    BEGIN;
-                    CREATE TABLE IF NOT EXISTS tasks (
+                let transaction = connection.transaction().unwrap();
+                transaction.execute("CREATE TABLE IF NOT EXISTS tasks (
                         id INT,
                         task_time INT NOT NULL,
                         task_type CHAR NOT NULL,
                         task_state CHAR NOT NULL,
-                        PRIMARY KEY (id),
-                    );
-                    CREATE INDEX IF NOT EXISTS timestamp_sort ON tasks.task_time;
-                COMMIT;
-                ", ());
-                result
+                        PRIMARY KEY (id)
+                    );", ()).unwrap();
+                transaction.execute("CREATE INDEX IF NOT EXISTS timesort ON tasks (task_time);", ()).unwrap();
+                transaction.commit()
+
             }).await.unwrap().unwrap();
             SqliteState {
                 pool
