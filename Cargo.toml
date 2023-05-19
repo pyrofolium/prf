@@ -1,0 +1,18 @@
+[package]
+name = "svix_task_scheduler"
+version = "0.1.0"
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+time = { version = "0.3.21", features = ["macros"] }
+#rusqlite = { version = "0.29.0", features = ["bundled"] }
+reqwest = { version = "0.11", features = [] }
+tokio = { version = "1", features = ["full"] }
+async-std = { version = "1.12.0", features = ["unstable"] }
+rand = "0.8.5"
+async-trait = "0.1.68"
+#redis = { version = "0.23.0", features = ["tokio-comp"] }
+#rustis = {version = "0.11.0", features = ["pool"]}# use fred.rs this has async transactions.
+fred = { version = "6.3.0", features = [] }
