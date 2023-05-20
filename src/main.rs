@@ -1,12 +1,84 @@
+use crate::state::{SqliteState, State};
+use tokio::runtime::Runtime;
+use crate::server::run_server;
+
+
 fn main() {
-    println!("Hello, world!");
+    //create task runner
+    //the sqlite libary is async and initializing requires async calls so use a tokiio runtime to drive it to the end.
+    let state = Runtime::new().unwrap().block_on(SqliteState::initialize_state());
+
+    //actual std::thread handler
+    let _ = executor::run(state.clone());
+
+    //create http server
+    Runtime::new().unwrap().block_on(async move {
+        run_server(state.clone()).await;
+    });
+}
+
+pub mod server {
+    use warp::Filter;
+    use crate::state::{SqliteState, State};
+    use crate::task::{TaskState};
+
+    pub async fn run_server(state: SqliteState) {
+        let warp_state = warp::any().map(move || {
+            state.clone()
+        });
+
+        async fn get_task_handler(id: u64, state: SqliteState) -> Result<impl warp::Reply, warp::Rejection> {
+            match state.get_task_from_id(id).await {
+                Some(task) => Ok(warp::reply::json(&task)),
+                None => Err(warp::reject::not_found())
+            }
+        }
+
+        async fn get_tasks_by_state_handler(task_state: TaskState, state: SqliteState) -> Result<impl warp::Reply, warp::Rejection> {
+            let result = state.get_all_tasks(&task_state).await;
+            Ok(warp::reply::json(&result))
+        }
+
+        async fn del_task_handler(id: u64, state: SqliteState) -> Result<impl warp::Reply, warp::Rejection> {
+            let rows_deleted = state.delete_task_from_id(id).await;
+            Ok(warp::reply::json(&rows_deleted))
+        }
+
+        let del_task_route = warp::delete()
+            .and(warp::path!("id" / u64))
+            .and(warp::path::end())
+            .and(warp_state.clone())
+            .and_then(del_task_handler);
+
+        let get_tasks_by_state_route = warp::get()
+            .and(warp::path!("taskstate" / TaskState))
+            .and(warp::path::end())
+            .and(warp_state.clone())
+            .and_then(get_tasks_by_state_handler);
+
+        let get_task_route = warp::get()
+            .and(warp::path!("id" / u64))
+            .and(warp::path::end())
+            .and(warp_state.clone())
+            .and_then(get_task_handler);
+
+        let router =
+            get_task_route
+                .or(get_tasks_by_state_route)
+                .or(del_task_route);
+
+
+        warp::serve(router).run(([127, 0, 0, 1], 3030)).await;
+    }
 }
 
 pub mod task {
+    use std::str::FromStr;
     use reqwest;
     use std::time::Duration;
     use async_std;
     use crate::task::TaskType::{Bar, Baz, Foo};
+    use serde::{Deserialize, Serialize};
 
 
     pub trait TaskStateConstants {
@@ -21,6 +93,7 @@ pub mod task {
         const COMPLETE: &'static str = "COMPLETE";
     }
 
+    //sort of redundant to the From impl below but it was required by warp.
     impl From<&TaskState> for &str {
         fn from(task_state: &TaskState) -> &'static str {
             match task_state {
@@ -44,7 +117,7 @@ pub mod task {
         }
     }
 
-    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
     pub enum TaskState {
         NotStarted,
         Started,
@@ -58,6 +131,19 @@ pub mod task {
                 Self::NotStarted => Self::Started,
                 Self::Started => Self::Complete,
                 Self::Complete => Self::Complete
+            }
+        }
+    }
+
+    impl FromStr for TaskState {
+        type Err = ();
+
+        fn from_str(s: &str) -> Result<Self, Self::Err> {
+            match s {
+                TaskState::STARTED => Ok(Self::Started),
+                TaskState::NOTSTARTED => Ok(Self::NotStarted),
+                TaskState::COMPLETE => Ok(Self::Complete),
+                _ => Err(())
             }
         }
     }
@@ -88,7 +174,7 @@ pub mod task {
         }
     }
 
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
     pub enum TaskType {
         Foo(Option<TaskId>, TaskTimeStamp, TaskState),
         Bar(Option<TaskId>, TaskTimeStamp, TaskState),
@@ -98,12 +184,23 @@ pub mod task {
     impl TaskType {
         pub fn transition_task(&self) -> TaskType {
             match self {
-                Self::Foo(id, time, state) =>
-                    Self::Foo(*id, *time, state.transition_state()),
-                Self::Bar(id, time, state) =>
-                    Self::Bar(*id, *time, state.transition_state()),
-                Self::Baz(id, time, state) =>
-                    Self::Baz(*id, *time, state.transition_state())
+                Foo(id, time, state) =>
+                    Foo(*id, *time, state.transition_state()),
+                Bar(id, time, state) =>
+                    Bar(*id, *time, state.transition_state()),
+                Baz(id, time, state) =>
+                    Baz(*id, *time, state.transition_state())
+            }
+        }
+
+        pub fn get_parameters_from_task(&self) -> (TaskId, &'static str) {
+            match self {
+                Foo(Some(id), _, state) => (*id, state.into()),
+                Bar(Some(id), _, state) => (*id, state.into()),
+                Baz(Some(id), _, state) => (*id, state.into()),
+                _ => {
+                    panic!("Cannot update tasks with no id.")
+                }
             }
         }
 
@@ -124,7 +221,7 @@ pub mod task {
                 }
                 Self::Bar(_, _, TaskState::Started) => {
                     let url = "https://www.whattimeisitrightnow.com";
-                    if let Ok(response) = reqwest::(url).await {
+                    if let Ok(response) = reqwest::get(url).await {
                         let status_code = response.status();
                         let text = response.text().await.unwrap();
                         println!("{text}");
@@ -151,21 +248,21 @@ mod state {
     use std::time::{SystemTime, UNIX_EPOCH};
     use rusqlite::OptionalExtension;
     use tokio::task::JoinHandle;
-    use crate::task;
 
     #[async_trait]
-    pub trait State: Sized {
+    pub trait State: Sized + Clone {
         async fn initialize_state() -> Self;
         async fn get_tasks_that_need_to_be_executed(&self) -> Vec<TaskType>;
         async fn add_task(&self, task: TaskType) -> u64;
         async fn get_all_tasks(&self, task_state: &TaskState) -> Vec<TaskType>;
-        async fn consume_tasks(&self, tasks_not_started: Vec<TaskType>) -> Vec<JoinHandle<TaskType>>;
-        async fn delete_task_from_id(&self, id: u64);
+        async fn consume_tasks(&self) -> Vec<JoinHandle<TaskType>>;
+        async fn delete_task_from_id(&self, id: u64) -> usize;
         async fn get_task_from_id(&self, id: u64) -> Option<TaskType>;
         async fn clear_all(&self);
+        async fn update_task(&self, task: TaskType);
     }
 
-
+    #[derive(Clone)]
     pub struct SqliteState {
         pool: Pool,
     }
@@ -194,44 +291,6 @@ mod state {
             SqliteState {
                 pool
             }
-        }
-
-        async fn consume_tasks(&self, tasks_not_started: Vec<TaskType>) -> Vec<JoinHandle<TaskType>> {
-            let mut join_handles = Vec::with_capacity(tasks_not_started.len());
-            let mut_ref_join_handler = &mut join_handles;
-            for task in tasks_not_started.into_iter() {
-                let pool = self.pool.clone();
-                let handle = tokio::spawn(async move {
-                    fn get_parameters_from_task(task: TaskType) -> (task::TaskId, &'static str) {
-                        match task {
-                            Foo(Some(id), _, state) => (id, (&state).into()),
-                            Bar(Some(id), _, state) => (id, (&state).into()),
-                            Baz(Some(id), _, state) => (id, (&state).into()),
-                            _ => {
-                                panic!("Cannot update tasks with no id.")
-                            }
-                        }
-                    }
-                    let connection = pool.get().await.unwrap();
-                    connection.interact(move |connection| {
-                        let parameters_not_started: (u64, &str) = get_parameters_from_task(task);
-                        connection.execute(
-                            "UPDATE tasks SET task_state = ?2 WHERE id = ?1",
-                            parameters_not_started).unwrap();
-                    }).await.unwrap();
-                    let pending_task = task.transition_task();
-                    let finished_task = pending_task.handle_task().await;
-                    connection.interact(move |connection| {
-                        let parameters_finished: (u64, &str) = get_parameters_from_task(finished_task);
-                        connection.execute(
-                            "UPDATE tasks SET task_state = ?2 WHERE id = ?1",
-                            parameters_finished).unwrap();
-                    }).await.unwrap();
-                    finished_task
-                });
-                mut_ref_join_handler.push(handle);
-            }
-            join_handles
         }
 
         async fn get_tasks_that_need_to_be_executed(&self) -> Vec<TaskType> {
@@ -268,7 +327,7 @@ mod state {
             };
             let connection = self.pool.get().await.unwrap();
             connection.interact(move |connection| {
-                let mut rows_updated: usize;
+                let rows_updated: usize;
                 let id = match optional_id {
                     Some(id) => {
                         rows_updated = connection.execute("INSERT INTO tasks (id, task_time, task_type, task_state) VALUES (?1, ?2, ?3, ?4)", (id, time, task_type, state)).unwrap();
@@ -313,18 +372,62 @@ mod state {
             }).await.unwrap()
         }
 
-        async fn clear_all(&self) {
+        async fn consume_tasks(&self) -> Vec<JoinHandle<TaskType>> {
             let connection = self.pool.get().await.unwrap();
-            connection.interact(|connection| {
-                connection.execute("DELETE FROM tasks;", ()).unwrap()
+            let tasks_to_be_completed = connection.interact(|connection| {
+                let transaction = connection.transaction().unwrap();
+                let mut tasks_to_be_completed = vec![];
+                let mut_ref_tasks_to_be_completed = &mut tasks_to_be_completed;
+                {
+                    let mut statement = transaction.prepare("SELECT id, task_time, task_type, task_state FROM tasks WHERE tasks.task_state = 'NOTSTARTED' AND task_time <= ?1;").unwrap();
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                    statement.query_map((now, ), |row| {
+                        let (id, time, task_type, state): (i64, i64, String, String) =
+                            (row.get(0).unwrap(), row.get(1).unwrap(), row.get(2).unwrap(), row.get(3).unwrap());
+                        match task_type.as_str() {
+                            TaskType::FOO => Ok(Foo(Some(id as u64), time as u64, state.as_str().into())),
+                            TaskType::BAR => Ok(Bar(Some(id as u64), time as u64, state.as_str().into())),
+                            TaskType::BAZ => Ok(Baz(Some(id as u64), time as u64, state.as_str().into())),
+                            _ => {
+                                panic!("invalid string, cannot convert to task.")
+                            }
+                        }
+                    }).unwrap().for_each(|task| {
+                        let pending_task = task.unwrap().transition_task();
+                        mut_ref_tasks_to_be_completed.push(pending_task);
+                    });
+                }
+                for task in tasks_to_be_completed.iter() {
+                    let parameters_not_started: (u64, &str) = task.get_parameters_from_task();
+                    transaction.execute(
+                        "UPDATE tasks SET task_state = ?2 WHERE id = ?1",
+                        parameters_not_started).unwrap();
+                }
+                transaction.commit().unwrap();
+                tasks_to_be_completed
             }).await.unwrap();
+
+
+            let mut join_handlers = Vec::with_capacity(tasks_to_be_completed.len());
+            for task in tasks_to_be_completed {
+                let handler = tokio::spawn(async move {
+                    let finished_task = task.handle_task().await;
+                    finished_task
+                });
+                join_handlers.push(handler);
+            }
+            join_handlers
         }
 
-        async fn delete_task_from_id(&self, id: u64) {
+        async fn delete_task_from_id(&self, id: u64) -> usize {
             let connection = self.pool.get().await.unwrap();
             connection.interact(move |connection| {
-                connection.execute("DELETE FROM tasks WHERE id = ?1;", (id, )).unwrap()
-            }).await.unwrap();
+                let rows_deleted = connection.execute("DELETE FROM tasks WHERE id = ?1;", (id, )).unwrap();
+                if rows_deleted > 1 {
+                    panic!("logic error only 1 or 0 rows should be deleted")
+                }
+                rows_deleted
+            }).await.unwrap()
         }
 
         async fn get_task_from_id(&self, id: u64) -> Option<TaskType> {
@@ -343,31 +446,66 @@ mod state {
                 }).optional().unwrap()
             }).await.unwrap()
         }
+
+        async fn clear_all(&self) {
+            let connection = self.pool.get().await.unwrap();
+            connection.interact(|connection| {
+                connection.execute("DELETE FROM tasks;", ()).unwrap()
+            }).await.unwrap();
+        }
+
+        async fn update_task(&self, task: TaskType) {
+            let connection = self.pool.get().await.unwrap();
+            connection.interact(move |connection| {
+                let parameters_finished: (u64, &str) = task.get_parameters_from_task();
+                connection.execute("UPDATE tasks SET task_state = ?2 WHERE id = ?1", parameters_finished).unwrap()
+            }).await.unwrap();
+        }
     }
 }
 
-mod executor {
-    use crate::state::State;
-    use async_trait::async_trait;
+pub mod executor {
+    use crate::state::{State};
+    use std::thread;
+    use tokio::task::JoinHandle;
     use crate::task::TaskType;
 
-    #[async_trait]
-    pub trait TaskRunner<T: State>: Sized {
-        fn initialize_runner(state: &T) -> Self;
-        async fn execute_tasks();
-        async fn add_task(task: TaskType);
-        async fn run(&self) -> Result<(), &'static str>;
-    }
-}
 
-mod app {
-    use crate::state::State;
-    use crate::executor::TaskRunner;
-
-    fn run_app<S: State, R: TaskRunner<S>>() {
-        // let state = S::initialize_state().unwrap();
-        // let runner = R::initialize_runner(state).unwrap();
-        // runner.run();
+    pub fn run<T: Sync + State + Send + 'static>(state: T) -> thread::JoinHandle<()> {
+        let handler = thread::spawn(move || {
+            let rt = tokio::runtime::Runtime::new().unwrap();
+            rt.block_on(async move {
+                let mut join_handles: Vec<JoinHandle<TaskType>> = vec![];
+                let mut temp: Vec<JoinHandle<TaskType>> = vec![];
+                loop {
+                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    let mut new_handles = state.consume_tasks().await;
+                    while new_handles.len() > 0 {
+                        join_handles.push(new_handles.pop().unwrap())
+                    }
+                    //state will lock the database via select and update transaction that finds all tasks that are ready to run
+                    //Tasks are set to run async via tokio spawn and return a handler handler is placed here.
+                    //Join handler also cannot be awaited on borrow, it has to be moved which makes for this
+                    // awkward second loop below and memory swapping between two vectors.
+                    //Basically this loop below updates the database if the task is seen to be finished.
+                    let mut_ref_temp = &mut temp;
+                    while join_handles.len() > 0 {
+                        let handler = join_handles.pop().unwrap();
+                        if handler.is_finished() {
+                            let task = handler.await.unwrap();
+                            let new_state = state.clone();
+                            tokio::spawn(async move {
+                                new_state.update_task(task).await;
+                            });
+                        } else {
+                            mut_ref_temp.push(handler);
+                        }
+                    }
+                    std::mem::swap(&mut join_handles, &mut temp);
+                }
+            });
+        });
+        handler
     }
 }
 
@@ -378,7 +516,6 @@ mod tests {
     use crate::task::TaskState::{Complete, NotStarted, Started};
     use crate::task::TaskType::{Bar, Baz, Foo};
     use std::time::{SystemTime, UNIX_EPOCH};
-    use async_std::prelude::FutureExt;
 
     #[tokio::test]
     async fn test_state() {
@@ -403,9 +540,10 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
         let v4 = state.get_tasks_that_need_to_be_executed().await;
         assert_eq!(v4.len(), 1);
-        let handles = state.consume_tasks(v4).await;
+        let handles = state.consume_tasks().await;
         for handle in handles {
-            handle.await.unwrap();
+            let task = handle.await.unwrap();
+            state.update_task(task).await;
         }
         let v5 = state.get_all_tasks(&Complete).await;
         assert_eq!(v5.len(), 1);
@@ -426,19 +564,20 @@ mod tests {
             let val = state.get_task_from_id(id).await;
             assert_eq!(val, None)
         }
-        let near_future_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 2;
+        // let near_future_time = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() + 2;
         let test_foo = Foo(None, 0, NotStarted);
         let test_bar = Bar(None, 0, NotStarted);
         state.add_task(test_foo).await;
-        state.add_task(test_bar).await;
+        let t_id = state.add_task(test_bar).await;
+        assert_eq!(state.get_task_from_id(t_id).await.unwrap(), Bar(Some(t_id), 0, NotStarted));
         let tasks_to_consume = state.get_all_tasks(&NotStarted).await;
         assert_eq!(tasks_to_consume.len(), 2);
-        let handlers2 = state.consume_tasks(tasks_to_consume).await;
+        let handlers2 = state.consume_tasks().await;
         for h in handlers2 {
-            h.await.unwrap();
+            let task = h.await.unwrap();
+            state.update_task(task).await;
         }
         assert_eq!(state.get_all_tasks(&NotStarted).await.len(), 0);
         assert_eq!(state.get_all_tasks(&Complete).await.len(), 2);
-
     }
 }

@@ -17,5 +17,7 @@ async-std = { version = "1.12.0", features = ["unstable"] }
 rand = "0.8.5"
 async-trait = "0.1.68"
 deadpool-sqlite = {version = "0.5.0", features = ["rt_async-std_1", "rt_tokio_1", "serde"]}
-hyper = { version = "1.0.0-rc.3", features = ["full"] }
-http-body-util = "0.1.0-rc.2"
+warp = "0.3"
+serde = "*"
+serde_json = "*"
+serde_derive = "*"
