@@ -10,7 +10,6 @@ use task_server::run_server;
 
 fn main() {
     //create task runner
-    //the sqlite libary is async and initializing requires async calls so use a tokio runtime to drive it to the end.
     let state = Runtime::new().unwrap().block_on(SqliteState::initialize_state());
     let _ = task_runner::run(state.clone()); //new thread
 
@@ -58,7 +57,6 @@ mod tests {
         let handles = state.consume_tasks().await;
         for handle in handles {
             let task = handle.await.unwrap();
-            state.update_task(task).await;
         }
         let v5 = state.filter_task_by_task_state(&Complete).await;
         assert_eq!(v5.len(), 1);
@@ -90,7 +88,6 @@ mod tests {
         let handlers2 = state.consume_tasks().await;
         for h in handlers2 {
             let task = h.await.unwrap();
-            state.update_task(task).await;
         }
         assert_eq!(state.filter_task_by_task_state(&NotStarted).await.len(), 0);
         assert_eq!(state.filter_task_by_task_state(&Complete).await.len(), 2);

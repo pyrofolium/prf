@@ -4,9 +4,6 @@ use crate::task::{TaskConstants, TaskState, TaskType};
 use crate::task::TaskState::NotStarted;
 use crate::task::TaskType::{Bar, Baz, Foo};
 
-//warp has a complex typing schema. Not worth it to bend a generic to get it working
-//with the State interface and warps types
-//pub async fn run_server<T: State>(state: T)
 pub async fn run_server(state: SqliteState) {
     let warp_state = warp::any().map(move || {
         state.clone()
