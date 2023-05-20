@@ -20,7 +20,9 @@ fn main() {
 pub mod server {
     use warp::Filter;
     use crate::state::{SqliteState, State};
-    use crate::task::{TaskState};
+    use crate::task::{TaskConstants, TaskState, TaskType};
+    use crate::task::TaskState::NotStarted;
+    use crate::task::TaskType::{Bar, Baz, Foo};
 
     pub async fn run_server(state: SqliteState) {
         let warp_state = warp::any().map(move || {
@@ -44,11 +46,40 @@ pub mod server {
             Ok(warp::reply::json(&rows_deleted))
         }
 
+        async fn post_new_task_handler(task_type_str: String, time: u64, state: SqliteState) -> Result<impl warp::Reply, warp::Rejection> {
+            let task = match task_type_str.as_str() {
+                TaskType::BAR => Bar(None, time, NotStarted),
+                TaskType::BAZ => Baz(None, time, NotStarted),
+                TaskType::FOO => Foo(None, time, NotStarted),
+                _ => {
+                    return Err(warp::reject::not_found());
+                }
+            };
+            let id = state.add_task(task).await;
+            Ok(warp::reply::json(&id))
+        }
+
+        async fn del_all_handler(state: SqliteState) -> Result<impl warp::Reply, warp::Rejection> {
+            state.clear_all().await;
+            Ok(warp::http::StatusCode::OK)
+        }
+
+        let post_new_task_route = warp::post()
+            .and(warp::path!(String / u64))
+            .and(warp::path::end())
+            .and(warp_state.clone())
+            .and_then(post_new_task_handler);
+
         let del_task_route = warp::delete()
             .and(warp::path!("id" / u64))
             .and(warp::path::end())
             .and(warp_state.clone())
             .and_then(del_task_handler);
+
+        let del_all_route = warp::delete()
+            .and(warp::path::end())
+            .and(warp_state.clone())
+            .and_then(del_all_handler);
 
         let get_tasks_by_state_route = warp::get()
             .and(warp::path!("taskstate" / TaskState))
@@ -65,7 +96,9 @@ pub mod server {
         let router =
             get_task_route
                 .or(get_tasks_by_state_route)
-                .or(del_task_route);
+                .or(del_task_route)
+                .or(post_new_task_route)
+                .or(del_all_route);
 
 
         warp::serve(router).run(([127, 0, 0, 1], 3030)).await;
@@ -74,11 +107,11 @@ pub mod server {
 
 pub mod task {
     use std::str::FromStr;
-    use reqwest;
     use std::time::Duration;
     use async_std;
     use crate::task::TaskType::{Bar, Baz, Foo};
     use serde::{Deserialize, Serialize};
+    use isahc;
 
 
     pub trait TaskStateConstants {
@@ -221,12 +254,10 @@ pub mod task {
                 }
                 Self::Bar(_, _, TaskState::Started) => {
                     let url = "https://www.whattimeisitrightnow.com";
-                    if let Ok(response) = reqwest::get(url).await {
-                        let status_code = response.status();
-                        let text = response.text().await.unwrap();
-                        println!("{text}");
-                        let status_code_str = status_code.as_str();
-                        std::println!("{status_code_str}");
+                    if let Ok(response) = isahc::get(url) {
+                        let status = response.status();
+                        let status_code = status.as_u16();
+                        println!("{status_code}");
                         self.transition_task()
                     } else {
                         panic!("Undefined behavior: {url} not found")
@@ -475,20 +506,20 @@ pub mod executor {
         let handler = thread::spawn(move || {
             let rt = tokio::runtime::Runtime::new().unwrap();
             rt.block_on(async move {
-                let mut join_handles: Vec<JoinHandle<TaskType>> = vec![];
-                let mut temp: Vec<JoinHandle<TaskType>> = vec![];
+                let size = 100;
+                let mut join_handles: Vec<JoinHandle<TaskType>> = Vec::with_capacity(size);
+                let mut temp: Vec<JoinHandle<TaskType>> = Vec::with_capacity(size);
                 loop {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+
                     let mut new_handles = state.consume_tasks().await;
                     while new_handles.len() > 0 {
                         join_handles.push(new_handles.pop().unwrap())
                     }
-                    //state will lock the database via select and update transaction that finds all tasks that are ready to run
-                    //Tasks are set to run async via tokio spawn and return a handler handler is placed here.
-                    //Join handler also cannot be awaited on borrow, it has to be moved which makes for this
-                    // awkward second loop below and memory swapping between two vectors.
-                    //Basically this loop below updates the database if the task is seen to be finished.
+
                     let mut_ref_temp = &mut temp;
+                    if join_handles.len() == 0 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
+                    }
                     while join_handles.len() > 0 {
                         let handler = join_handles.pop().unwrap();
                         if handler.is_finished() {
