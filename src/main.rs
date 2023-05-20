@@ -12,14 +12,13 @@ fn main() {
     //create task runner
     //the sqlite libary is async and initializing requires async calls so use a tokio runtime to drive it to the end.
     let state = Runtime::new().unwrap().block_on(SqliteState::initialize_state());
-
-    //actual std::thread handler
-    let _ = task_runner::run(state.clone());
+    let _ = task_runner::run(state.clone()); //new thread
 
     //create http server
     Runtime::new().unwrap().block_on(async move {
         run_server(state.clone()).await;
     });
+
 }
 
 
@@ -43,7 +42,7 @@ mod tests {
         assert_eq!(id1, 1);
         let id2 = state.add_task(task.clone()).await;
         assert_eq!(id2, 2);
-        let v = state.get_all_tasks(&NotStarted).await;
+        let v = state.filter_task_by_task_state(&NotStarted).await;
         assert_eq!(v.len(), 2);
         let v2 = state.get_tasks_that_need_to_be_executed().await;
         assert_eq!(v2.len(), 0);
@@ -61,11 +60,11 @@ mod tests {
             let task = handle.await.unwrap();
             state.update_task(task).await;
         }
-        let v5 = state.get_all_tasks(&Complete).await;
+        let v5 = state.filter_task_by_task_state(&Complete).await;
         assert_eq!(v5.len(), 1);
-        let v6 = state.get_all_tasks(&Started).await;
+        let v6 = state.filter_task_by_task_state(&Started).await;
         assert_eq!(v6.len(), 0);
-        let v7 = state.get_all_tasks(&NotStarted).await;
+        let v7 = state.filter_task_by_task_state(&NotStarted).await;
         assert_eq!(v7.len(), 2);
         let task1 = state.get_task_from_id(1).await.unwrap();
         let task2 = state.get_task_from_id(2).await.unwrap();
@@ -86,14 +85,14 @@ mod tests {
         state.add_task(test_foo).await;
         let t_id = state.add_task(test_bar).await;
         assert_eq!(state.get_task_from_id(t_id).await.unwrap(), Bar(Some(t_id), 0, NotStarted));
-        let tasks_to_consume = state.get_all_tasks(&NotStarted).await;
+        let tasks_to_consume = state.filter_task_by_task_state(&NotStarted).await;
         assert_eq!(tasks_to_consume.len(), 2);
         let handlers2 = state.consume_tasks().await;
         for h in handlers2 {
             let task = h.await.unwrap();
             state.update_task(task).await;
         }
-        assert_eq!(state.get_all_tasks(&NotStarted).await.len(), 0);
-        assert_eq!(state.get_all_tasks(&Complete).await.len(), 2);
+        assert_eq!(state.filter_task_by_task_state(&NotStarted).await.len(), 0);
+        assert_eq!(state.filter_task_by_task_state(&Complete).await.len(), 2);
     }
 }

@@ -5,8 +5,8 @@ use crate::task::TaskState::NotStarted;
 use crate::task::TaskType::{Bar, Baz, Foo};
 
 //warp has a complex typing schema. Not worth it to bend a generic to get it working
-//with the State interface
-// pub async fn run_server<T: State>(state: T)
+//with the State interface and warps types
+//pub async fn run_server<T: State>(state: T)
 pub async fn run_server(state: SqliteState) {
     let warp_state = warp::any().map(move || {
         state.clone()
@@ -20,7 +20,7 @@ pub async fn run_server(state: SqliteState) {
     }
 
     async fn get_tasks_by_state_handler(task_state: TaskState, state: SqliteState) -> Result<impl warp::Reply, warp::Rejection> {
-        let result = state.get_all_tasks(&task_state).await;
+        let result = state.filter_task_by_task_state(&task_state).await;
         Ok(warp::reply::json(&result))
     }
 
