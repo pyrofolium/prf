@@ -23,11 +23,11 @@ Expose an API that can:
 
 # Solution
 ## 5 files:
-Task: Has types for each task and functions related to the task itself, Foo, Bar and Baz
-State: A trait called State responsible for handling all shared state. This was implemented with sqlite.
-Runner: A task runner that composes State and Task types into a loop that constantly runs based off of whats in the database.
-Server: Warp http server with routes made according to the spec to manipulate the database.
-Main: Not really a module, just the fn main. It runs two threads of Runner and Server. I mention it here because it can be changed to several main targets.
+- Task: Has types for each task and functions related to the task itself, Foo, Bar and Baz
+- State: A trait called State responsible for handling all shared state. This was implemented with sqlite.
+- Runner: A task runner that composes State and Task types into a loop that constantly runs based off of whats in the database.
+- Server: Warp http server with routes made according to the spec to manipulate the database.
+- Main: Not really a module, just the fn main. It runs two threads of Runner and Server. I mention it here because it can be changed to several main targets.
 
 ## Sample http calls:
 
