@@ -1,6 +1,6 @@
 # task-runner 
 
-Small python challenge I found online, I decided to do a lightweight monolithic version with rust and sqlite. 
+Small python challenge I found online, I decided to do a lightweight monolithic version with rust and sqlite to mess with rust async. Can get wierd with sqlite as it's not that well supported with async await syntax. 
 
 ## Task Scheduler
 The service consists of an API listener, which accepts HTTP API calls, and a worker which executes tasks of different types. There are 3 task types: "Foo", "Bar", and "Baz".
